@@ -1,9 +1,12 @@
+from importlib.resources import path
+import io
 import os
 import boto3
 import logging
 import requests
 import re
 import datetime
+import json
 from boto3.s3.transfer import TransferConfig
 
 '''
@@ -33,19 +36,21 @@ class mixpanelS3:
     PART_SIZE = 5*1024*1024 # 5 Mbytes is minimum part size for S3 multipart uploads.
 
     def __init__(self, mixpanel_api_secret, aws_region, aws_id, aws_secret, logger, use_threads=True):        
-        self.api_secret = mixpanel_api_secret
-        self.aws_region = aws_region
-        self.aws_id = aws_id
-        self.aws_secret = aws_secret
-        self.use_threads = use_threads
-        self.logger = logger
-        self.s3_client = boto3.client(
-            service_name='s3', 
-            region_name=aws_region,
-            aws_access_key_id=aws_id,
-            aws_secret_access_key=aws_secret)
+        self.api_secret             = mixpanel_api_secret
+        self.aws_region             = aws_region
+        self.aws_id                 = aws_id
+        self.aws_secret             = aws_secret
+        self.use_threads            = use_threads
+        self.logger                 = logger
+        self.s3_client              = boto3.client(
+            service_name            = 's3', 
+            region_name             = aws_region,
+            aws_access_key_id       = aws_id,
+            aws_secret_access_key   = aws_secret)
     
     # See: https://mixpanel.com/help/reference/exporting-raw-data
+
+
     def exportEvents(self, from_date, to_date, event=None, where=None, stream=True):
         req_params = {
             'url': 'https://data.mixpanel.com/api/2.0/export/',
@@ -55,7 +60,7 @@ class mixpanelS3:
             },
             'method': 'GET',
             'headers': {
-                'Accept-Encoding': 'gzip'
+                'Accept-Encoding': 'json'
             },
             'auth': (self.api_secret, ''),
             'stream': stream
@@ -64,33 +69,65 @@ class mixpanelS3:
             req_params['params']['event'] = event
         if where:
             req_params['params']['where'] = event
-        response = requests.request(**req_params)
-        self.logger.info('Got HTTP response from {}: {}'.format(response.request.url, response.status_code))
+        response = requests.request( **req_params )
+        self.logger.info('Got HTTP response from {}: {}'.format( response.request.url, response.status_code ))
         return response
-    
-    def s3MultipartUpload(self, httpResponse, bucket, key):
+
+
+    def s3MultipartUpload( self, httpResponse, bucket, key ):
+        
         if httpResponse.status_code != requests.codes.ok:
             self.logger.error('Nothing to upload! HTTP Status: {}'.format(httpResponse.status_code))
             return
         config = TransferConfig(
-            use_threads=self.use_threads, 
-            multipart_threshold=self.PART_SIZE,
-            multipart_chunksize=self.PART_SIZE
+            use_threads         = self.use_threads, 
+            multipart_threshold = self.PART_SIZE,
+            multipart_chunksize = self.PART_SIZE
 		)
-        # resposne.raw from request module returns a file object you can read as new bytes are fetched from the network if stream=True
-        with httpResponse.raw as data:
-            self.logger.info('Uploading multipart file to S3 bucket: {} key: {}'.format(bucket, key))
-            self.s3_client.upload_fileobj(data, bucket, key, Config=config)
-            self.logger.info('DONE Uploading multipart file to S3 bucket: {} key: {}'.format(bucket, key))
 
-    def rawEventsToS3(self, from_date, to_date, bucket, key):
+        # print(httpResponse.raw)
+
+        # raw_json = httpResponse.json()
+        # data_json = raw_json.items()
+        # for key, value in raw_json.items():
+        # for key in raw_json['properties'].keys():
+        #     key = re.sub('$', '', key )
+
+        # with open('json_data.json', 'w') as outfile:
+        #     outfile.write(data_json)
+       
+        
+        # response.raw from request module returns a file object you can read as new bytes are fetched from the network if stream = True
+        with httpResponse.raw as data:
+            data_str = data.data.decode('utf-8')
+            data_lines = data_str.split('\n')
+            data_lines = [json.loads(line) for line in data_lines if line]
+
+            for json_line in data_lines:
+                for dic_key, dic_value in json_line['properties'].items():
+                    if dic_key.startswith('$'):
+                        new_key = re.sub('$', '', dic_key)
+                        json_line[new_key] = dic_value
+                        del json_line[dic_key]
+
+            data_lines  = [json.dumps(line) for line in data_lines]
+            data_str    = '\n'.join(data_lines)
+            data_bytes  = bytes(data_str, 'utf-8')
+            data_bytes        = io.BytesIO(data_bytes)
+            
+            self.logger.info('Uploading multipart file to S3 bucket: {} key: {}'.format(bucket, key))
+            self.s3_client.upload_fileobj(data_bytes, bucket, key, Config = config)
+            self.logger.info('DONE Uploading multipart file to S3 bucket: {} key: {}'.format( bucket, key ))
+            
+
+    def rawEventsToS3( self, from_date, to_date, bucket, key ):
         self.s3MultipartUpload(
             self.exportEvents(
-                from_date=from_date,
-                to_date=to_date
+                from_date   = from_date,
+                to_date     = to_date
             ),
-            bucket=bucket,
-            key=key
+            bucket  = bucket,
+            key     = key
         )
 
 # Set up logging
@@ -104,23 +141,23 @@ mixpanel = mixpanelS3(
     AWS_REGION, 
     AWS_ACCESS_KEY_ID, 
     AWS_SECRET_ACCESS_KEY, 
-    logger=log
+    logger  =   log
 )
 start = datetime.date.fromisoformat(START_DATE)
-end   = datetime.date.today() - datetime.timedelta(days=5) # most recent end date is 5 days ago, since Mixpanel may take that long to make events available in API
+end   = datetime.date.today() - datetime.timedelta( days = 5 ) # most recent end date is 5 days ago, since Mixpanel may take that long to make events available in API
 
 if end >= start: 
     for day in ( start + datetime.timedelta(days=n) for n in range( (end - start).days + 1 ) ):
         # this will iterate 1 day at a time between start and end dates
         log.info('Exporting date: {}'.format(day.isoformat()))
         mixpanel.rawEventsToS3(
-            from_date=day.isoformat(),
-            to_date=day.isoformat(),
-            bucket=S3_BUCKET,
-            key="{path}/{partition}/rawEvents_{isodate}.json.gz".format(
-                path=S3_PATH, 
-                partition=day.strftime("year=%Y/month=%m/day=%d"), 
-                isodate=day.isoformat()
+            from_date       = day.isoformat(),
+            to_date         = day.isoformat(),
+            bucket          = S3_BUCKET,
+            key             = "{path}/{partition}/rawEvents_{isodate}.json".format(
+                path        = S3_PATH, 
+                partition   = day.strftime("year=%Y/month=%m/day=%d"), 
+                isodate     = day.isoformat()
             )
         )
 else:
